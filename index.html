@@ -22,6 +22,7 @@
 <div id="ui">
   <input type="file" id="file" accept=".vrm">
   <button id="start">Старт камеры и трекинга</button>
+  <button id="cal">Калибровка (смотрите прямо)</button>
   <button id="cam2">Сменить камеру (фронт/тыл)</button>
   <label><input type="checkbox" id="skel"> Скелет (риг)</label>
   <label><input type="checkbox" id="wire"> Сетка тела</label>
@@ -108,6 +109,7 @@ async function startCam() {
   const fm = video.srcObject.getVideoTracks()[0].getSettings().facingMode;
   $('st').textContent = 'Камера: ' + (fm === 'environment' ? 'ТЫЛОВАЯ (нажмите «Сменить камеру»)' : fm === 'user' ? 'фронтальная' : 'тип не определён, смотрите превью справа внизу');
 }
+$('cal').onclick = () => { if (headRaw) { Object.assign(cal, headRaw); $('st').textContent = 'Калибровка сохранена'; } };
 $('cam2').onclick = async () => { camMode = camMode === 'user' ? 'environment' : 'user'; if (running) await startCam(); };
 $('start').onclick = async () => {
   $('st').textContent = 'Загрузка моделей…';
@@ -115,13 +117,14 @@ $('start').onclick = async () => {
   const base = 'https://storage.googleapis.com/mediapipe-models/';
   const opts = (path, extra, d) => ({ baseOptions: { modelAssetPath: base + path, delegate: d }, runningMode: 'VIDEO', ...extra });
   const mk = async (C, path, extra) => { try { return await C.createFromOptions(fs, opts(path, extra, 'GPU')); } catch { return await C.createFromOptions(fs, opts(path, extra, 'CPU')); } };
-  faceLM = await mk(FaceLandmarker, 'face_landmarker/face_landmarker/float16/1/face_landmarker.task', { outputFaceBlendshapes: true, outputFacialTransformationMatrixes: true });
+  faceLM = await mk(FaceLandmarker, 'face_landmarker/face_landmarker/float16/1/face_landmarker.task', { outputFaceBlendshapes: true });
   mkPose = () => mk(PoseLandmarker, 'pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task', {});
   await startCam(); running = true;
 };
 
 const bone = (n) => vrm.humanoid.getNormalizedBoneNode(n);
-const I = new THREE.Quaternion(), sm = {};
+const I = new THREE.Quaternion(), sm = {}, cal = { pitch: 0, yaw: 0, roll: 0 };
+let headRaw = null;
 
 function applyFace() {
   const bs = face?.faceBlendshapes?.[0]?.categories;
@@ -133,12 +136,18 @@ function applyFace() {
     set('aa', g('jawOpen'));
     set('happy', (g('mouthSmileLeft') + g('mouthSmileRight')) / 2);
   }
-  const m = face?.facialTransformationMatrixes?.[0];
-  if (m) {
-    const qq = new THREE.Quaternion();
-    new THREE.Matrix4().fromArray(m.data).decompose(new THREE.Vector3(), qq, new THREE.Vector3());
-    const e = new THREE.Euler().setFromQuaternion(qq, 'YXZ');
-    const tq = new THREE.Quaternion().setFromEuler(new THREE.Euler(e.x, -e.y, -e.z, 'YXZ')); // если наклон вверх/вниз инвертирован — смените знак e.x
+  const lm = face?.faceLandmarks?.[0];
+  if (lm && video.videoWidth) {
+    const vw = video.videoWidth, vh = video.videoHeight, A = lm[234], B = lm[454], N = lm[1], T = lm[10], C = lm[152];
+    const w = Math.hypot((B.x - A.x) * vw, (B.y - A.y) * vh);
+    const cl = (v) => Math.max(-1, Math.min(1, v));
+    headRaw = {
+      yaw: -Math.asin(cl(((N.x - (A.x + B.x) / 2) * vw / w) * 2.2)),
+      pitch: ((N.y - T.y) / (C.y - T.y) - 0.58) * 2.2,
+      roll: Math.atan2((B.y - A.y) * vh, (B.x - A.x) * vw),
+    };
+    const tq = new THREE.Quaternion().setFromEuler(
+      new THREE.Euler(headRaw.pitch - cal.pitch, headRaw.yaw - cal.yaw, headRaw.roll - cal.roll, 'YXZ'));
     bone('head').quaternion.slerp(I.clone().slerp(tq, 0.6), 0.5);
     bone('neck').quaternion.slerp(I.clone().slerp(tq, 0.4), 0.5);
   }
@@ -185,10 +194,10 @@ const clock = new THREE.Clock();
   const dt = clock.getDelta();
   if (vrm && running && video.readyState >= 2 && video.currentTime !== lastT) {
     lastT = video.currentTime; const t = performance.now();
-    try { face = faceLM.detectForVideo(video, t); applyFace(); } catch (err) { $('st').textContent = 'Ошибка лица: ' + err.message; }
+    try { face = faceLM.detectForVideo(video, t); applyFace(); } catch (err) { $('st').textContent = 'Ошибка лица: ' + String(err.message).slice(0, 120); }
     if ($('arms').checked) {
       if (!poseLM && !poseLoading) { poseLoading = true; mkPose().then((m) => { poseLM = m; }); }
-      if (poseLM && ++fr % 2 === 0) { try { pose = poseLM.detectForVideo(video, t); applyPose(); } catch (err) { $('st').textContent = 'Ошибка рук: ' + err.message; } }
+      if (poseLM && ++fr % 2 === 0) { try { pose = poseLM.detectForVideo(video, t); applyPose(); } catch (err) { $('st').textContent = 'Ошибка рук: ' + String(err.message).slice(0, 120); } }
     }
   }
   vrm?.update(dt);
