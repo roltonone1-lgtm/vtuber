@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anime VTuber 3D</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#1b1d22;font:14px system-ui,sans-serif;color:#eee}
+  canvas{position:fixed;inset:0;width:100%;height:100%}
+  #ov{pointer-events:none}
+  #ui{position:fixed;top:10px;left:10px;z-index:5;background:#000a;padding:10px 12px;border-radius:10px;display:flex;flex-direction:column;gap:6px;max-width:220px}
+  #ui label{display:flex;gap:6px;align-items:center}
+  button,input[type=file]{font:inherit}
+  video{position:fixed;right:8px;bottom:8px;width:96px;height:72px;object-fit:cover;transform:scaleX(-1);border-radius:8px;z-index:4;pointer-events:none}
+  body.obs video{opacity:0}
+  body.obs #ui,body.obs #tg,body.obs #st{display:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas><canvas id="ov"></canvas><video id="cam" playsinline muted></video>
+<button id="tg" style="position:fixed;right:10px;top:10px;z-index:6;font-size:18px">☰</button>
+<div id="ui">
+  <input type="file" id="file" accept=".vrm">
+  <button id="start">Старт камеры и трекинга</button>
+  <button id="cal">Калибровка (смотрите прямо)</button>
+  <button id="cam2">Сменить камеру (фронт/тыл)</button>
+  <label><input type="checkbox" id="skel"> Скелет (риг)</label>
+  <label><input type="checkbox" id="wire"> Сетка тела</label>
+  <label><input type="checkbox" id="face"> Сетка лица</label>
+  <label><input type="checkbox" id="arms"> Руки (нагружает)</label>
+  <button id="bg">Фон: тёмный</button>
+</div>
+<small id="st" style="position:fixed;left:8px;bottom:8px;max-width:60vw;max-height:4.5em;overflow:hidden;background:#000a;padding:4px 6px;border-radius:6px;z-index:5;font-size:12px">Загрузите .vrm</small>
+<script type="importmap">{"imports":{
+"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+"three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+"@pixiv/three-vrm":"https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.3.3/lib/three-vrm.module.min.js",
+"@mediapipe/tasks-vision":"https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
+import { FilesetResolver, FaceLandmarker, PoseLandmarker } from '@mediapipe/tasks-vision';
+
+const $ = (id) => document.getElementById(id);
+const canvas = $('c'), ov = $('ov'), ctx = ov.getContext('2d'), video = $('cam');
+if (location.search.includes('obs')) { document.body.classList.add('obs'); document.body.style.background = 'transparent'; }
+
+// ---------- 3D сцена ----------
+const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: false });
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(30, 1, 0.1, 20);
+camera.position.set(0, 1.25, 3.0);
+camera.lookAt(0, 1.2, 0);
+const sun = new THREE.DirectionalLight(0xffffff, 2); sun.position.set(1, 2, 2);
+scene.add(sun, new THREE.AmbientLight(0xffffff, 0.8));
+
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5)); renderer.setSize(w, h, false);
+  ov.width = w; ov.height = h;
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+// ---------- VRM ----------
+let vrm = null, skelHelper = null;
+const loader = new GLTFLoader();
+loader.register((p) => new VRMLoaderPlugin(p));
+
+async function loadVrm(url) {
+  if (vrm) { scene.remove(vrm.scene); VRMUtils.deepDispose(vrm.scene); }
+  if (skelHelper) { scene.remove(skelHelper); skelHelper = null; }
+  const gltf = await loader.loadAsync(url);
+  vrm = gltf.userData.vrm;
+  VRMUtils.rotateVRM0(vrm);
+  vrm.scene.traverse((o) => { o.frustumCulled = false; });
+  scene.add(vrm.scene);
+  const h = vrm.humanoid;
+  h.getNormalizedBoneNode('leftUpperArm').rotation.z = -1.2;   // руки вниз
+  h.getNormalizedBoneNode('rightUpperArm').rotation.z = 1.2;
+  skelHelper = new THREE.SkeletonHelper(vrm.scene);
+  skelHelper.visible = $('skel').checked; scene.add(skelHelper);
+  applyWire();
+  $('st').textContent = 'Модель загружена';
+}
+$('file').onchange = (e) => { const f = e.target.files[0]; if (f) loadVrm(URL.createObjectURL(f)); };
+const q = new URLSearchParams(location.search).get('vrm'); if (q) loadVrm(q);
+
+function applyWire() {
+  vrm?.scene.traverse((o) => {
+    if (!o.isMesh) return;
+    [].concat(o.material).forEach((m) => { m.wireframe = $('wire').checked; });
+  });
+}
+$('wire').onchange = applyWire;
+$('skel').onchange = () => { if (skelHelper) skelHelper.visible = $('skel').checked; };
+$('tg').onclick = () => { const u = $('ui'); u.style.display = u.style.display === 'none' ? '' : 'none'; };
+const bgs = [['тёмный', '#1b1d22'], ['зелёный', '#00b140'], ['прозрачный', 'transparent']]; let bgi = 0;
+$('bg').onclick = () => { bgi = (bgi + 1) % bgs.length; document.body.style.background = bgs[bgi][1]; $('bg').textContent = 'Фон: ' + bgs[bgi][0]; };
+
+// ---------- Трекинг (MediaPipe) ----------
+const D1 = location.search.includes('gpu') ? 'GPU' : 'CPU', D2 = D1 === 'GPU' ? 'CPU' : 'GPU';
+let dbg = 0, mkPose, poseLoading = false, fr = 0, faceLM, poseLM, running = false, lastT = -1, face = null, pose = null;
+let camMode = 'user';
+async function startCam() {
+  video.srcObject?.getTracks().forEach((t) => t.stop());
+  video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: camMode }, width: 480, height: 360, frameRate: 30 } });
+  await video.play();
+  const fm = video.srcObject.getVideoTracks()[0].getSettings().facingMode;
+  $('st').textContent = 'Камера: ' + (fm === 'environment' ? 'ТЫЛОВАЯ (нажмите «Сменить камеру»)' : fm === 'user' ? 'фронтальная' : 'тип не определён, смотрите превью справа внизу');
+}
+$('cal').onclick = () => { if (headRaw) { Object.assign(cal, headRaw); $('st').textContent = 'Калибровка сохранена'; } };
+$('cam2').onclick = async () => { camMode = camMode === 'user' ? 'environment' : 'user'; if (running) await startCam(); };
+$('start').onclick = async () => {
+  $('st').textContent = 'Загрузка моделей…';
+  const fs = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  const base = 'https://storage.googleapis.com/mediapipe-models/';
+  const opts = (path, extra, d) => ({ baseOptions: { modelAssetPath: base + path, delegate: d }, runningMode: 'VIDEO', ...extra });
+  const mk = async (C, path, extra) => { try { return await C.createFromOptions(fs, opts(path, extra, D1)); } catch { return await C.createFromOptions(fs, opts(path, extra, D2)); } };
+  faceLM = await mk(FaceLandmarker, 'face_landmarker/face_landmarker/float16/1/face_landmarker.task', { outputFaceBlendshapes: true });
+  mkPose = () => mk(PoseLandmarker, 'pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task', {});
+  await startCam(); running = true; $('ui').style.display = 'none';
+};
+
+const bone = (n) => vrm.humanoid.getNormalizedBoneNode(n);
+const I = new THREE.Quaternion(), sm = {}, cal = { pitch: 0, yaw: 0, roll: 0 };
+let headRaw = null;
+
+function applyFace() {
+  const bs = face?.faceBlendshapes?.[0]?.categories;
+  if (bs && vrm.expressionManager) {
+    const g = (n) => bs.find((c) => c.categoryName === n)?.score ?? 0, em = vrm.expressionManager;
+    const set = (k, v) => { sm[k] = (sm[k] ?? v) * 0.5 + v * 0.5; em.setValue(k, sm[k]); };
+    set('blinkLeft', g('eyeBlinkRight'));   // зеркало
+    set('blinkRight', g('eyeBlinkLeft'));
+    set('aa', g('jawOpen'));
+    set('happy', (g('mouthSmileLeft') + g('mouthSmileRight')) / 2);
+  }
+  const lm = face?.faceLandmarks?.[0];
+  if (lm && video.videoWidth) {
+    const vw = video.videoWidth, vh = video.videoHeight, A = lm[234], B = lm[454], N = lm[1], T = lm[10], C = lm[152];
+    const w = Math.hypot((B.x - A.x) * vw, (B.y - A.y) * vh);
+    const cl = (v) => Math.max(-1, Math.min(1, v)), k = (v, m) => Math.max(-m, Math.min(m, v));
+    headRaw = {
+      yaw: -1.3 * Math.asin(cl(((N.x - (A.x + B.x) / 2) * vw / w) * 2.2)),
+      pitch: ((N.y - T.y) / (C.y - T.y) - 0.58) * 4,
+      roll: Math.atan2((B.y - A.y) * vh, (B.x - A.x) * vw),
+    };
+    const tq = new THREE.Quaternion().setFromEuler(
+      new THREE.Euler(k(headRaw.pitch - cal.pitch, 0.6), k(headRaw.yaw - cal.yaw, 0.9), k(headRaw.roll - cal.roll, 0.6), 'YXZ'));
+    bone('head').quaternion.slerp(I.clone().slerp(tq, 0.7), 0.7);
+    bone('neck').quaternion.slerp(I.clone().slerp(tq, 0.4), 0.7);
+    for (const n of ['head', 'neck']) { const q = bone(n).quaternion; if (![q.x, q.y, q.z, q.w].every(Number.isFinite)) q.identity(); }
+  }
+}
+
+const dirOf = (a, b) => new THREE.Vector3(-(b.x - a.x), -(b.y - a.y), -(b.z - a.z)).normalize();
+function driveArm(side, L, s, e, w) {
+  if ([s, e, w].some((i) => (L[i].visibility ?? 1) < 0.5)) return;
+  const rest = new THREE.Vector3(side === 'left' ? 1 : -1, 0, 0);
+  const qu = new THREE.Quaternion().setFromUnitVectors(rest, dirOf(L[s], L[e]));
+  const qw = new THREE.Quaternion().setFromUnitVectors(rest, dirOf(L[e], L[w]));
+  bone(side + 'UpperArm').quaternion.slerp(qu, 0.5);
+  bone(side + 'LowerArm').quaternion.slerp(qu.clone().invert().multiply(qw), 0.5);
+}
+function applyPose() {
+  const L = pose?.worldLandmarks?.[0]; if (!L) return;
+  driveArm('left', L, 12, 14, 16);    // зеркало: правая рука пользователя -> левая аватара
+  driveArm('right', L, 11, 13, 15);
+}
+
+// ---------- Оверлей сетки лица поверх головы аватара ----------
+const proj = (v) => { v = v.clone().project(camera); return [(v.x + 1) / 2 * ov.width, (1 - v.y) / 2 * ov.height]; };
+function drawFace() {
+  ctx.clearRect(0, 0, ov.width, ov.height);
+  const lm = face?.faceLandmarks?.[0];
+  if (!$('face').checked || !lm || !vrm) return;
+  const p = new THREE.Vector3(); bone('head').getWorldPosition(p); p.y += 0.08;
+  const [cx, cy] = proj(p), [rx] = proj(p.clone().setX(p.x + 0.075));
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const fw = Math.hypot((lm[234].x - lm[454].x) * vw, (lm[234].y - lm[454].y) * vh);
+  const s = (2 * Math.abs(rx - cx)) / fw, n = lm[1];
+  const pt = (i) => [cx - (lm[i].x - n.x) * vw * s, cy + (lm[i].y - n.y) * vh * s];
+  ctx.strokeStyle = 'rgba(0,255,255,.55)'; ctx.lineWidth = 0.6; ctx.beginPath();
+  for (const { start, end } of FaceLandmarker.FACE_LANDMARKS_TESSELATION) {
+    const a = pt(start), b = pt(end); ctx.moveTo(...a); ctx.lineTo(...b);
+  }
+  ctx.stroke();
+}
+
+// ---------- Цикл ----------
+const clock = new THREE.Clock();
+(function tick() {
+  requestAnimationFrame(tick);
+  const dt = clock.getDelta();
+  if (vrm && running && video.readyState >= 2 && video.currentTime !== lastT) {
+    lastT = video.currentTime; const t = performance.now();
+    try { face = faceLM.detectForVideo(video, t); applyFace(); } catch (err) { $('st').textContent = 'Ошибка лица: ' + String(err.message).slice(0, 120); }
+    if (++dbg % 10 === 0) {
+      $('st').textContent = face?.faceLandmarks?.length && headRaw
+        ? `${D1} | лицо найдено | поворот ${(headRaw.yaw - cal.yaw).toFixed(2)} кивок ${(headRaw.pitch - cal.pitch).toFixed(2)} рот ${(sm.aa ?? 0).toFixed(2)}`
+        : `лицо НЕ найдено (видео ${video.videoWidth}x${video.videoHeight}, ${D1})`;
+    }
+    if ($('arms').checked) {
+      if (!poseLM && !poseLoading) { poseLoading = true; mkPose().then((m) => { poseLM = m; }); }
+      if (poseLM && ++fr % 2 === 0) { try { pose = poseLM.detectForVideo(video, t); applyPose(); } catch (err) { $('st').textContent = 'Ошибка рук: ' + String(err.message).slice(0, 120); } }
+    }
+  }
+  vrm?.update(dt);
+  renderer.render(scene, camera);
+  drawFace();
+})();
+
+</script>
+</body>
+</html>
