@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anime VTuber 3D</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#1b1d22;font:14px system-ui,sans-serif;color:#eee}
+  canvas{position:fixed;inset:0;width:100%;height:100%}
+  #ov{pointer-events:none}
+  #ui{position:fixed;top:10px;left:10px;z-index:5;background:#000a;padding:10px 12px;border-radius:10px;display:flex;flex-direction:column;gap:6px;max-width:220px}
+  #ui label{display:flex;gap:6px;align-items:center}
+  button,input[type=file]{font:inherit}
+  video{position:fixed;width:2px;height:2px;opacity:0;pointer-events:none}
+  body.obs #ui{display:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas><canvas id="ov"></canvas><video id="cam" playsinline muted></video>
+<div id="ui">
+  <input type="file" id="file" accept=".vrm">
+  <button id="start">Старт камеры и трекинга</button>
+  <label><input type="checkbox" id="skel"> Скелет (риг)</label>
+  <label><input type="checkbox" id="wire"> Сетка тела</label>
+  <label><input type="checkbox" id="face"> Сетка лица</label>
+  <button id="bg">Фон: тёмный</button>
+  <small id="st">Загрузите .vrm</small>
+</div>
+<script type="importmap">{"imports":{
+"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+"three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+"@pixiv/three-vrm":"https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.3.3/lib/three-vrm.module.min.js",
+"@mediapipe/tasks-vision":"https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
+import { FilesetResolver, FaceLandmarker, PoseLandmarker } from '@mediapipe/tasks-vision';
+
+const $ = (id) => document.getElementById(id);
+const canvas = $('c'), ov = $('ov'), ctx = ov.getContext('2d'), video = $('cam');
+if (location.search.includes('obs')) { document.body.classList.add('obs'); document.body.style.background = 'transparent'; }
+
+// ---------- 3D сцена ----------
+const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(30, 1, 0.1, 20);
+camera.position.set(0, 1.3, 2.4);
+camera.lookAt(0, 1.25, 0);
+const sun = new THREE.DirectionalLight(0xffffff, 2); sun.position.set(1, 2, 2);
+scene.add(sun, new THREE.AmbientLight(0xffffff, 0.8));
+
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setPixelRatio(devicePixelRatio); renderer.setSize(w, h, false);
+  ov.width = w; ov.height = h;
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+// ---------- VRM ----------
+let vrm = null, skelHelper = null;
+const loader = new GLTFLoader();
+loader.register((p) => new VRMLoaderPlugin(p));
+
+async function loadVrm(url) {
+  if (vrm) { scene.remove(vrm.scene); VRMUtils.deepDispose(vrm.scene); }
+  if (skelHelper) { scene.remove(skelHelper); skelHelper = null; }
+  const gltf = await loader.loadAsync(url);
+  vrm = gltf.userData.vrm;
+  VRMUtils.rotateVRM0(vrm);
+  vrm.scene.traverse((o) => { o.frustumCulled = false; });
+  scene.add(vrm.scene);
+  const h = vrm.humanoid;
+  h.getNormalizedBoneNode('leftUpperArm').rotation.z = -1.2;   // руки вниз
+  h.getNormalizedBoneNode('rightUpperArm').rotation.z = 1.2;
+  skelHelper = new THREE.SkeletonHelper(vrm.scene);
+  skelHelper.visible = $('skel').checked; scene.add(skelHelper);
+  applyWire();
+  $('st').textContent = 'Модель загружена';
+}
+$('file').onchange = (e) => { const f = e.target.files[0]; if (f) loadVrm(URL.createObjectURL(f)); };
+const q = new URLSearchParams(location.search).get('vrm'); if (q) loadVrm(q);
+
+function applyWire() {
+  vrm?.scene.traverse((o) => {
+    if (!o.isMesh) return;
+    [].concat(o.material).forEach((m) => { m.wireframe = $('wire').checked; });
+  });
+}
+$('wire').onchange = applyWire;
+$('skel').onchange = () => { if (skelHelper) skelHelper.visible = $('skel').checked; };
+const bgs = [['тёмный', '#1b1d22'], ['зелёный', '#00b140'], ['прозрачный', 'transparent']]; let bgi = 0;
+$('bg').onclick = () => { bgi = (bgi + 1) % bgs.length; document.body.style.background = bgs[bgi][1]; $('bg').textContent = 'Фон: ' + bgs[bgi][0]; };
+
+// ---------- Трекинг (MediaPipe) ----------
+let faceLM, poseLM, running = false, lastT = -1, face = null, pose = null;
+$('start').onclick = async () => {
+  $('st').textContent = 'Загрузка моделей…';
+  const fs = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  const base = 'https://storage.googleapis.com/mediapipe-models/';
+  faceLM = await FaceLandmarker.createFromOptions(fs, {
+    baseOptions: { modelAssetPath: base + 'face_landmarker/face_landmarker/float16/1/face_landmarker.task', delegate: 'GPU' },
+    runningMode: 'VIDEO', outputFaceBlendshapes: true, outputFacialTransformationMatrixes: true,
+  });
+  poseLM = await PoseLandmarker.createFromOptions(fs, {
+    baseOptions: { modelAssetPath: base + 'pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task', delegate: 'GPU' },
+    runningMode: 'VIDEO',
+  });
+  video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 640, height: 480 } });
+  await video.play(); running = true; $('st').textContent = 'Трекинг работает';
+};
+
+const bone = (n) => vrm.humanoid.getNormalizedBoneNode(n);
+const I = new THREE.Quaternion();
+
+function applyFace() {
+  const bs = face?.faceBlendshapes?.[0]?.categories;
+  if (bs && vrm.expressionManager) {
+    const g = (n) => bs.find((c) => c.categoryName === n)?.score ?? 0, em = vrm.expressionManager;
+    em.setValue('blinkLeft', g('eyeBlinkRight'));   // зеркало
+    em.setValue('blinkRight', g('eyeBlinkLeft'));
+    em.setValue('aa', g('jawOpen'));
+    em.setValue('happy', (g('mouthSmileLeft') + g('mouthSmileRight')) / 2);
+  }
+  const m = face?.facialTransformationMatrixes?.[0];
+  if (m) {
+    const e = new THREE.Euler().setFromQuaternion(
+      new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().fromArray(m.data)), 'YXZ');
+    const tq = new THREE.Quaternion().setFromEuler(new THREE.Euler(e.x, -e.y, -e.z, 'YXZ')); // если наклон вверх/вниз инвертирован — смените знак e.x
+    bone('head').quaternion.slerp(I.clone().slerp(tq, 0.6), 0.5);
+    bone('neck').quaternion.slerp(I.clone().slerp(tq, 0.4), 0.5);
+  }
+}
+
+const dirOf = (a, b) => new THREE.Vector3(-(b.x - a.x), -(b.y - a.y), -(b.z - a.z)).normalize();
+function driveArm(side, L, s, e, w) {
+  if ([s, e, w].some((i) => (L[i].visibility ?? 1) < 0.5)) return;
+  const rest = new THREE.Vector3(side === 'left' ? 1 : -1, 0, 0);
+  const qu = new THREE.Quaternion().setFromUnitVectors(rest, dirOf(L[s], L[e]));
+  const qw = new THREE.Quaternion().setFromUnitVectors(rest, dirOf(L[e], L[w]));
+  bone(side + 'UpperArm').quaternion.slerp(qu, 0.5);
+  bone(side + 'LowerArm').quaternion.slerp(qu.clone().invert().multiply(qw), 0.5);
+}
+function applyPose() {
+  const L = pose?.worldLandmarks?.[0]; if (!L) return;
+  driveArm('left', L, 12, 14, 16);    // зеркало: правая рука пользователя -> левая аватара
+  driveArm('right', L, 11, 13, 15);
+}
+
+// ---------- Оверлей сетки лица поверх головы аватара ----------
+const proj = (v) => { v = v.clone().project(camera); return [(v.x + 1) / 2 * ov.width, (1 - v.y) / 2 * ov.height]; };
+function drawFace() {
+  ctx.clearRect(0, 0, ov.width, ov.height);
+  const lm = face?.faceLandmarks?.[0];
+  if (!$('face').checked || !lm || !vrm) return;
+  const p = new THREE.Vector3(); bone('head').getWorldPosition(p); p.y += 0.08;
+  const [cx, cy] = proj(p), [rx] = proj(p.clone().setX(p.x + 0.075));
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const fw = Math.hypot((lm[234].x - lm[454].x) * vw, (lm[234].y - lm[454].y) * vh);
+  const s = (2 * Math.abs(rx - cx)) / fw, n = lm[1];
+  const pt = (i) => [cx - (lm[i].x - n.x) * vw * s, cy + (lm[i].y - n.y) * vh * s];
+  ctx.strokeStyle = 'rgba(0,255,255,.55)'; ctx.lineWidth = 0.6; ctx.beginPath();
+  for (const { start, end } of FaceLandmarker.FACE_LANDMARKS_TESSELATION) {
+    const a = pt(start), b = pt(end); ctx.moveTo(...a); ctx.lineTo(...b);
+  }
+  ctx.stroke();
+}
+
+// ---------- Цикл ----------
+const clock = new THREE.Clock();
+(function tick() {
+  requestAnimationFrame(tick);
+  const dt = clock.getDelta();
+  if (vrm && running && video.readyState >= 2 && video.currentTime !== lastT) {
+    lastT = video.currentTime; const t = performance.now();
+    face = faceLM.detectForVideo(video, t); pose = poseLM.detectForVideo(video, t);
+    applyFace(); applyPose();
+  }
+  vrm?.update(dt);
+  renderer.render(scene, camera);
+  drawFace();
+})();
+
+</script>
+</body>
+</html>
